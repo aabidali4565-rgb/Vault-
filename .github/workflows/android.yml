@@ -14,15 +14,59 @@ jobs:
           rm -rf test
           M=android/app/src/main/AndroidManifest.xml
           grep -q allowBackup $M || sed -i 's/<application/<application android:allowBackup="false"/' $M
+          sed -i 's#</activity>#<intent-filter><action android:name="android.intent.action.VIEW"/><category android:name="android.intent.category.DEFAULT"/><category android:name="android.intent.category.BROWSABLE"/><data android:scheme="content"/><data android:scheme="file"/><data android:mimeType="*/*"/></intent-filter><intent-filter><action android:name="android.intent.action.SEND"/><category android:name="android.intent.category.DEFAULT"/><data android:mimeType="*/*"/></intent-filter></activity>#' $M
           K=$(find android/app/src/main -name MainActivity.kt | head -n1)
           P=$(grep -m1 '^package' $K)
           cat > $K <<EOF
           $P
+          import android.content.Intent
+          import android.net.Uri
           import android.os.Bundle
-          import android.view.WindowManager
           import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+          import java.io.File
           class MainActivity : FlutterActivity() {
-            override fun onCreate(b: Bundle?) { super.onCreate(b); window.setFlags(8192, 8192) }
+            private var pending: String? = null
+            override fun onCreate(b: Bundle?) {
+              super.onCreate(b)
+              window.setFlags(8192, 8192)
+              handle(intent)
+            }
+            override fun onNewIntent(i: Intent) {
+              super.onNewIntent(i)
+              setIntent(i)
+              handle(i)
+            }
+            private fun handle(i: Intent?) {
+              if (i == null) return
+              var uri: Uri? = null
+              if (i.action == Intent.ACTION_VIEW) {
+                uri = i.data
+              } else if (i.action == Intent.ACTION_SEND) {
+                uri = i.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+              }
+              if (uri == null) return
+              try {
+                val out = File(cacheDir, "in_" + System.currentTimeMillis() + ".vlt")
+                contentResolver.openInputStream(uri)?.use { inp ->
+                  out.outputStream().use { o -> inp.copyTo(o) }
+                }
+                pending = out.absolutePath
+              } catch (e: Exception) {
+              }
+            }
+            override fun configureFlutterEngine(e: FlutterEngine) {
+              super.configureFlutterEngine(e)
+              MethodChannel(e.dartExecutor.binaryMessenger, "vault/share").setMethodCallHandler { c, r ->
+                if (c.method == "get") {
+                  r.success(pending)
+                  pending = null
+                } else {
+                  r.notImplemented()
+                }
+              }
+            }
           }
           EOF
           mkdir -p ~/.gradle
@@ -66,6 +110,7 @@ jobs:
           VoidCallback? lockHook;
           final nav = GlobalKey<NavigatorState>();
           final rnd = Random.secure();
+          final Map<String, String> sess = {};
 
           List<int> rb(int n) => List.generate(n, (_) => rnd.nextInt(256));
           Future<SecretKey> dk(String c, List<int> s) => Pbkdf2(macAlgorithm: Hmac.sha256(), iterations: 100000, bits: 256).deriveKeyFromPassword(password: c, nonce: s);
@@ -136,7 +181,7 @@ jobs:
           }
           Future<String> tp() async => (await getTemporaryDirectory()).path;
           Future<String> vd() async { final d = Directory('${(await getApplicationDocumentsDirectory()).path}/vault'); if (!await d.exists()) await d.create(recursive: true); return d.path; }
-          Future<void> clean() async { try { for (final e in Directory(await tp()).listSync()) { if (e is File && e.path.split('/').last.startsWith('v_')) await shred(e); } } catch (_) {} }
+          Future<void> clean() async { try { for (final e in Directory(await tp()).listSync()) { if (e is File) { final n = e.path.split('/').last; if (n.startsWith('v_') || n.startsWith('in_')) await shred(e); } } } catch (_) {} }
           Future<List<Map<String, dynamic>>> li() async { final s = (await SharedPreferences.getInstance()).getString('i'); return s == null ? [] : (jsonDecode(s) as List).cast<Map<String, dynamic>>(); }
           Future<void> si(List<Map<String, dynamic>> l) async { await (await SharedPreferences.getInstance()).setString('i', jsonEncode(l)); }
 
@@ -178,7 +223,7 @@ jobs:
             bool locked = true;
             @override void initState() { super.initState(); WidgetsBinding.instance.addObserver(this); lockHook = lock; clean(); pinSet().then((v) { if (mounted) setState(() => has = v); }); }
             @override void dispose() { WidgetsBinding.instance.removeObserver(this); super.dispose(); }
-            void lock() { nav.currentState?.popUntil((r) => r.isFirst); if (mounted) setState(() => locked = true); }
+            void lock() { sess.clear(); nav.currentState?.popUntil((r) => r.isFirst); if (mounted) setState(() => locked = true); }
             @override void didChangeAppLifecycleState(AppLifecycleState s) { if (s == AppLifecycleState.paused && !skip) lock(); if (s == AppLifecycleState.resumed) skip = false; }
             @override Widget build(BuildContext c) {
               if (has == null) return const Scaffold(body: Center(child: CircularProgressIndicator()));
@@ -222,9 +267,34 @@ jobs:
           class Home extends StatefulWidget { const Home({super.key}); @override State<Home> createState() => _HS(); }
           class _HS extends State<Home> {
             List<Map<String, dynamic>> items = [];
-            @override void initState() { super.initState(); load(); }
+            @override void initState() {
+              super.initState();
+              load();
+              WidgetsBinding.instance.addPostFrameCallback((_) => incoming());
+            }
             Future<void> load() async { final l = await li(); if (mounted) setState(() => items = l.reversed.toList()); }
             void sn(String s) { if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(s))); }
+
+            Future<void> incoming() async {
+              try {
+                final p = await const MethodChannel('vault/share').invokeMethod<String>('get');
+                if (p == null) return;
+                final f = File(p);
+                final rf = await f.open();
+                final h = await rf.read(4);
+                await rf.close();
+                if (!listEquals(h, kM)) { await shred(f); sn('Yeh Vault ki .vlt file nahi hai'); return; }
+                final id = nid(), dst = '${await vd()}/$id.vlt';
+                await f.copy(dst);
+                await shred(f);
+                final it = <String, dynamic>{'id': id, 'name': 'Received file', 'size': await File(dst).length(), 'ts': DateTime.now().millisecondsSinceEpoch};
+                final ix = await li();
+                ix.add(it);
+                await si(ix);
+                await load();
+                if (mounted) await open(it);
+              } catch (_) {}
+            }
 
             Future<void> add() async {
               skip = true;
@@ -265,15 +335,28 @@ jobs:
             }
 
             Future<String?> dtmp(Map<String, dynamic> it) async {
-              final code = await ask(context, 'Code enter karein');
-              if (code == null || code.isEmpty || !mounted) return null;
-              final src = '${await vd()}/${it['id']}.vlt', tmp = '${await tp()}/v_${it['id']}';
+              final id = it['id'] as String;
+              String? code = sess[id];
+              if (code == null) {
+                code = await ask(context, 'Code enter karein');
+                if (code == null || code.isEmpty || !mounted) return null;
+              }
+              final cd = code;
+              final src = '${await vd()}/$id.vlt', tmp = '${await tp()}/v_$id';
               try {
-                final ext = await busy(context, () => decBg(code, src, tmp));
+                final ext = await busy(context, () => decBg(cd, src, tmp));
+                sess[id] = cd;
+                if (mounted) setState(() {});
                 if (ext.isEmpty) return tmp;
                 await File(tmp).rename('$tmp.$ext');
                 return '$tmp.$ext';
-              } catch (_) { await shred(File(tmp)); sn('Code galat hai ya file kharab hai'); return null; }
+              } catch (_) {
+                sess.remove(id);
+                await shred(File(tmp));
+                sn('Code galat hai ya file kharab hai');
+                if (mounted) setState(() {});
+                return null;
+              }
             }
 
             Future<void> open(Map<String, dynamic> it) async { final p = await dtmp(it); if (p == null || !mounted) return; await Navigator.push(context, MaterialPageRoute(builder: (_) => Viewer(p))); }
@@ -295,6 +378,7 @@ jobs:
             Future<void> del(Map<String, dynamic> it) async {
               final ok = await showDialog<bool>(context: context, builder: (x) => AlertDialog(title: const Text('Delete karein?'), content: const Text('File hamesha ke liye mit jayegi.'), actions: [TextButton(onPressed: () => Navigator.pop(x, false), child: const Text('Nahi')), FilledButton(onPressed: () => Navigator.pop(x, true), child: const Text('Delete'))]));
               if (ok != true) return;
+              sess.remove(it['id']);
               await shred(File('${await vd()}/${it['id']}.vlt'));
               final ix = await li();
               ix.removeWhere((e) => e['id'] == it['id']);
@@ -302,14 +386,55 @@ jobs:
               load();
             }
 
-            @override Widget build(BuildContext c) => Scaffold(
-              appBar: AppBar(title: const Text('Vault'), actions: [IconButton(tooltip: 'Import .vlt', icon: const Icon(Icons.download), onPressed: imp), IconButton(tooltip: 'Lock', icon: const Icon(Icons.lock), onPressed: () => lockHook?.call())]),
-              floatingActionButton: FloatingActionButton.extended(onPressed: add, icon: const Icon(Icons.add), label: const Text('Encrypt karein')),
-              body: items.isEmpty ? const Center(child: Padding(padding: EdgeInsets.all(24), child: Text('Vault khali hai.\nEncrypt button dabayein.', textAlign: TextAlign.center))) : ListView(children: [for (final it in items) ListTile(
-                leading: const Icon(Icons.lock_outline), title: Text(it['name'], maxLines: 1, overflow: TextOverflow.ellipsis),
-                subtitle: Text('${(it['size'] / 1048576).toStringAsFixed(2)} MB'), onTap: () => open(it),
-                trailing: PopupMenuButton<String>(onSelected: (v) { if (v == 's') share(it); if (v == 'd') save(it); if (v == 'x') del(it); }, itemBuilder: (_) => const [PopupMenuItem(value: 's', child: Text('Share (encrypted)')), PopupMenuItem(value: 'd', child: Text('Decrypt aur save')), PopupMenuItem(value: 'x', child: Text('Delete'))]))]),
-            );
+            Widget lst(List<Map<String, dynamic>> l, bool u, String empty) {
+              if (l.isEmpty) return Center(child: Padding(padding: const EdgeInsets.all(24), child: Text(empty, textAlign: TextAlign.center)));
+              return ListView(children: [for (final it in l) ListTile(
+                leading: Icon(u ? Icons.lock_open : Icons.lock_outline, color: u ? Colors.greenAccent : null),
+                title: Text(it['name'], maxLines: 1, overflow: TextOverflow.ellipsis),
+                subtitle: Text('${(it['size'] / 1048576).toStringAsFixed(2)} MB${u ? '  •  Unlocked' : ''}'),
+                onTap: () => open(it),
+                trailing: PopupMenuButton<String>(
+                  onSelected: (v) {
+                    if (v == 's') share(it);
+                    if (v == 'd') save(it);
+                    if (v == 'r') { sess.remove(it['id']); setState(() {}); }
+                    if (v == 'x') del(it);
+                  },
+                  itemBuilder: (_) => [
+                    const PopupMenuItem(value: 's', child: Text('Share (encrypted)')),
+                    const PopupMenuItem(value: 'd', child: Text('Decrypt aur save')),
+                    if (u) const PopupMenuItem(value: 'r', child: Text('Dobara lock karein')),
+                    const PopupMenuItem(value: 'x', child: Text('Delete')),
+                  ],
+                ),
+              )]);
+            }
+
+            @override Widget build(BuildContext c) {
+              final lk = items.where((e) => !sess.containsKey(e['id'])).toList();
+              final ul = items.where((e) => sess.containsKey(e['id'])).toList();
+              return DefaultTabController(
+                length: 2,
+                child: Scaffold(
+                  appBar: AppBar(
+                    title: const Text('Vault'),
+                    actions: [
+                      IconButton(tooltip: 'Import .vlt', icon: const Icon(Icons.download), onPressed: imp),
+                      IconButton(tooltip: 'Lock', icon: const Icon(Icons.lock), onPressed: () => lockHook?.call()),
+                    ],
+                    bottom: TabBar(tabs: [
+                      Tab(icon: const Icon(Icons.lock), text: 'Locked (${lk.length})'),
+                      Tab(icon: const Icon(Icons.lock_open), text: 'Unlocked (${ul.length})'),
+                    ]),
+                  ),
+                  floatingActionButton: FloatingActionButton.extended(onPressed: add, icon: const Icon(Icons.add), label: const Text('Encrypt karein')),
+                  body: TabBarView(children: [
+                    lst(lk, false, 'Koi locked file nahi.\nEncrypt button dabayein.'),
+                    lst(ul, true, 'Abhi koi file unlock nahi hui.\nLocked file par tap karke code daalein.'),
+                  ]),
+                ),
+              );
+            }
           }
 
           class Viewer extends StatefulWidget { final String p; const Viewer(this.p, {super.key}); @override State<Viewer> createState() => _VS(); }

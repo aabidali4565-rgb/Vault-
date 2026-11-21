@@ -1,26 +1,275 @@
-name: Android CI
+name: Build Vault APK
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: set up JDK 11
-      uses: actions/setup-java@v4
-      with:
-        java-version: '11'
-        distribution: 'temurin'
-        cache: gradle
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
 
-    - name: Grant execute permission for gradlew
-      run: chmod +x gradlew
-    - name: Build with Gradle
-      run: ./gradlew build
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Create project and write app code
+        run: |
+          flutter create vault_app --platforms=android --org com.vault
+          cd vault_app
+          rm -f test/widget_test.dart
+
+          cat > pubspec.yaml <<'EOF'
+          name: vault_app
+          description: Encrypt and decrypt images and videos with a code.
+          publish_to: 'none'
+          version: 1.0.0+1
+
+          environment:
+            sdk: '>=3.0.0 <4.0.0'
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            file_picker: ^8.1.2
+            cryptography: ^2.7.0
+
+          flutter:
+            uses-material-design: true
+          EOF
+
+          cat > lib/main.dart <<'EOF'
+          import 'dart:convert';
+          import 'dart:math';
+          import 'dart:typed_data';
+
+          import 'package:cryptography/cryptography.dart';
+          import 'package:file_picker/file_picker.dart';
+          import 'package:flutter/foundation.dart';
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+
+          void main() => runApp(const VaultApp());
+
+          const List<int> _magic = [0x56, 0x4C, 0x54, 0x31];
+
+          Future<SecretKey> _deriveKey(String code, List<int> salt) {
+            final pbkdf2 = Pbkdf2(
+              macAlgorithm: Hmac.sha256(),
+              iterations: 100000,
+              bits: 256,
+            );
+            return pbkdf2.deriveKeyFromPassword(password: code, nonce: salt);
+          }
+
+          Future<Uint8List> encryptJob(Map<String, dynamic> a) async {
+            final String code = a['code'];
+            final Uint8List data = a['data'];
+            final List<int> ext = utf8.encode(a['ext'] as String);
+
+            final rnd = Random.secure();
+            final salt = List<int>.generate(16, (_) => rnd.nextInt(256));
+            final key = await _deriveKey(code, salt);
+
+            final plain = BytesBuilder()
+              ..addByte(ext.length)
+              ..add(ext)
+              ..add(data);
+
+            final box =
+                await AesGcm.with256bits().encrypt(plain.toBytes(), secretKey: key);
+
+            return (BytesBuilder()
+                  ..add(_magic)
+                  ..add(salt)
+                  ..add(box.nonce)
+                  ..add(box.cipherText)
+                  ..add(box.mac.bytes))
+                .toBytes();
+          }
+
+          Future<Map<String, dynamic>> decryptJob(Map<String, dynamic> a) async {
+            final String code = a['code'];
+            final Uint8List d = a['data'];
+            if (d.length < 48 || !listEquals(d.sublist(0, 4), _magic)) {
+              throw Exception('Yeh file is app se encrypt nahi hui.');
+            }
+            final salt = d.sublist(4, 20);
+            final nonce = d.sublist(20, 32);
+            final cipher = d.sublist(32, d.length - 16);
+            final mac = d.sublist(d.length - 16);
+
+            final key = await _deriveKey(code, salt);
+            final plain = await AesGcm.with256bits().decrypt(
+              SecretBox(cipher, nonce: nonce, mac: Mac(mac)),
+              secretKey: key,
+            );
+            final extLen = plain[0];
+            final ext = utf8.decode(plain.sublist(1, 1 + extLen));
+            return {'ext': ext, 'data': Uint8List.fromList(plain.sublist(1 + extLen))};
+          }
+
+          String generateCode([int len = 12]) {
+            const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+            final r = Random.secure();
+            return List.generate(len, (_) => chars[r.nextInt(chars.length)]).join();
+          }
+
+          class VaultApp extends StatelessWidget {
+            const VaultApp({super.key});
+            @override
+            Widget build(BuildContext context) => MaterialApp(
+                  title: 'Vault',
+                  debugShowCheckedModeBanner: false,
+                  theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
+                  home: const HomePage(),
+                );
+          }
+
+          class HomePage extends StatefulWidget {
+            const HomePage({super.key});
+            @override
+            State<HomePage> createState() => _HomePageState();
+          }
+
+          class _HomePageState extends State<HomePage> {
+            final _codeCtrl = TextEditingController();
+            bool _busy = false;
+            String _status = '';
+
+            void _msg(String s) => setState(() => _status = s);
+
+            Future<void> _encrypt() async {
+              final pick = await FilePicker.platform.pickFiles(
+                type: FileType.media,
+                withData: true,
+              );
+              if (pick == null || pick.files.single.bytes == null) return;
+              final f = pick.files.single;
+
+              if (_codeCtrl.text.trim().isEmpty) _codeCtrl.text = generateCode();
+              final code = _codeCtrl.text.trim();
+
+              setState(() => _busy = true);
+              _msg('Encrypt ho rahi hai...');
+              try {
+                final out = await compute(encryptJob, {
+                  'code': code,
+                  'data': f.bytes!,
+                  'ext': f.extension ?? '',
+                });
+                final base = f.name.contains('.')
+                    ? f.name.substring(0, f.name.lastIndexOf('.'))
+                    : f.name;
+                final path = await FilePicker.platform.saveFile(
+                  dialogTitle: 'Encrypted file save karein',
+                  fileName: '$base.vlt',
+                  bytes: out,
+                );
+                _msg(path == null
+                    ? 'Save cancel ho gaya.'
+                    : 'Encrypt ho gayi! Code yaad rakhein: $code');
+              } catch (e) {
+                _msg('Error: $e');
+              } finally {
+                setState(() => _busy = false);
+              }
+            }
+
+            Future<void> _decrypt() async {
+              final code = _codeCtrl.text.trim();
+              if (code.isEmpty) {
+                _msg('Pehle code enter karein.');
+                return;
+              }
+              final pick = await FilePicker.platform
+                  .pickFiles(type: FileType.any, withData: true);
+              if (pick == null || pick.files.single.bytes == null) return;
+              final f = pick.files.single;
+
+              setState(() => _busy = true);
+              _msg('Decrypt ho rahi hai...');
+              try {
+                final res = await compute(decryptJob, {'code': code, 'data': f.bytes!});
+                final ext = res['ext'] as String;
+                final base = f.name.contains('.')
+                    ? f.name.substring(0, f.name.lastIndexOf('.'))
+                    : f.name;
+                final path = await FilePicker.platform.saveFile(
+                  dialogTitle: 'Decrypted file save karein',
+                  fileName: ext.isEmpty ? base : '$base.$ext',
+                  bytes: res['data'] as Uint8List,
+                );
+                _msg(path == null ? 'Save cancel ho gaya.' : 'Decrypt ho gayi!');
+              } catch (e) {
+                _msg('Code galat hai ya file kharab hai.');
+              } finally {
+                setState(() => _busy = false);
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(title: const Text('Vault - Encrypt / Decrypt')),
+                body: ListView(
+                  padding: const EdgeInsets.all(20),
+                  children: [
+                    TextField(
+                      controller: _codeCtrl,
+                      decoration: InputDecoration(
+                        labelText: 'Code',
+                        border: const OutlineInputBorder(),
+                        suffixIcon: IconButton(
+                          icon: const Icon(Icons.copy),
+                          onPressed: () =>
+                              Clipboard.setData(ClipboardData(text: _codeCtrl.text)),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: TextButton.icon(
+                        onPressed: () => setState(() => _codeCtrl.text = generateCode()),
+                        icon: const Icon(Icons.autorenew),
+                        label: const Text('Naya code generate karein'),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    FilledButton.icon(
+                      onPressed: _busy ? null : _encrypt,
+                      icon: const Icon(Icons.lock),
+                      label: const Text('Image / Video Encrypt karein'),
+                    ),
+                    const SizedBox(height: 12),
+                    OutlinedButton.icon(
+                      onPressed: _busy ? null : _decrypt,
+                      icon: const Icon(Icons.lock_open),
+                      label: const Text('.vlt file Decrypt karein'),
+                    ),
+                    const SizedBox(height: 24),
+                    if (_busy) const LinearProgressIndicator(),
+                    const SizedBox(height: 12),
+                    SelectableText(_status),
+                  ],
+                ),
+              );
+            }
+          }
+          EOF
+
+      - name: Build APK
+        working-directory: vault_app
+        run: |
+          flutter pub get
+          flutter build apk --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vault-apk
+          path: vault_app/build/app/outputs/flutter-apk/app-release.apk

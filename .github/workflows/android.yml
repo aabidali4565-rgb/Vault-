@@ -21,13 +21,36 @@ jobs:
         run: |
           flutter create vault_app --platforms=android --org com.vault
           cd vault_app
-          rm -f test/widget_test.dart
+          rm -rf test
+
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          grep -q allowBackup "$MANIFEST" || sed -i 's/<application/<application android:allowBackup="false"/' "$MANIFEST"
+
+          MAIN=$(find android/app/src/main -name 'MainActivity.kt' | head -n1)
+          PKG=$(grep -m1 '^package' "$MAIN")
+          cat > "$MAIN" <<EOF
+          $PKG
+
+          import android.os.Bundle
+          import android.view.WindowManager
+          import io.flutter.embedding.android.FlutterActivity
+
+          class MainActivity : FlutterActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.setFlags(
+                      WindowManager.LayoutParams.FLAG_SECURE,
+                      WindowManager.LayoutParams.FLAG_SECURE
+                  )
+              }
+          }
+          EOF
 
           cat > pubspec.yaml <<'EOF'
           name: vault_app
-          description: Encrypt and decrypt images and videos with a code.
+          description: Secure vault for images and videos.
           publish_to: 'none'
-          version: 1.0.0+1
+          version: 2.0.0+1
 
           environment:
             sdk: '>=3.0.0 <4.0.0'
@@ -35,8 +58,12 @@ jobs:
           dependencies:
             flutter:
               sdk: flutter
-            file_picker: ^8.1.2
+            file_picker: ^8.1.6
             cryptography: ^2.7.0
+            shared_preferences: ^2.3.2
+            path_provider: ^2.1.4
+            share_plus: ^10.1.2
+            video_player: ^2.9.1
 
           flutter:
             uses-material-design: true
@@ -44,6 +71,8 @@ jobs:
 
           cat > lib/main.dart <<'EOF'
           import 'dart:convert';
+          import 'dart:io';
+          import 'dart:isolate';
           import 'dart:math';
           import 'dart:typed_data';
 
@@ -52,212 +81,818 @@ jobs:
           import 'package:flutter/foundation.dart';
           import 'package:flutter/material.dart';
           import 'package:flutter/services.dart';
+          import 'package:path_provider/path_provider.dart';
+          import 'package:share_plus/share_plus.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
+          import 'package:video_player/video_player.dart';
 
-          void main() => runApp(const VaultApp());
-
-          const List<int> _magic = [0x56, 0x4C, 0x54, 0x31];
+          // ---------------------------------------------------------------
+          // CRYPTO (AES-256-GCM, chunked, key = PBKDF2(code))
+          // ---------------------------------------------------------------
+          const kMagic = <int>[0x56, 0x4C, 0x54, 0x32]; // VLT2
+          const kChunk = 1024 * 1024;
 
           Future<SecretKey> _deriveKey(String code, List<int> salt) {
-            final pbkdf2 = Pbkdf2(
+            return Pbkdf2(
               macAlgorithm: Hmac.sha256(),
               iterations: 100000,
               bits: 256,
-            );
-            return pbkdf2.deriveKeyFromPassword(password: code, nonce: salt);
+            ).deriveKeyFromPassword(password: code, nonce: salt);
           }
 
-          Future<Uint8List> encryptJob(Map<String, dynamic> a) async {
-            final String code = a['code'];
-            final Uint8List data = a['data'];
-            final List<int> ext = utf8.encode(a['ext'] as String);
+          Uint8List _nonce(List<int> prefix, int counter) {
+            final n = Uint8List(12);
+            n.setRange(0, 8, prefix);
+            n.buffer.asByteData().setUint32(8, counter);
+            return n;
+          }
 
+          Future<void> _encryptFile(
+              String code, String src, String dst, String ext) async {
             final rnd = Random.secure();
-            final salt = List<int>.generate(16, (_) => rnd.nextInt(256));
+            final salt =
+                Uint8List.fromList(List.generate(16, (_) => rnd.nextInt(256)));
+            final prefix =
+                Uint8List.fromList(List.generate(8, (_) => rnd.nextInt(256)));
             final key = await _deriveKey(code, salt);
+            final aes = AesGcm.with256bits();
+            final extBytes = utf8.encode(ext.length > 20 ? '' : ext);
 
-            final plain = BytesBuilder()
-              ..addByte(ext.length)
-              ..add(ext)
-              ..add(data);
+            final input = await File(src).open();
+            final out = File(dst).openWrite();
+            try {
+              out.add(kMagic);
+              out.add(salt);
+              out.add(prefix);
+              out.addByte(extBytes.length);
+              final meta = await aes.encrypt(extBytes,
+                  secretKey: key, nonce: _nonce(prefix, 0), aad: const [9]);
+              out.add(meta.cipherText);
+              out.add(meta.mac.bytes);
 
-            final box =
-                await AesGcm.with256bits().encrypt(plain.toBytes(), secretKey: key);
-
-            return (BytesBuilder()
-                  ..add(_magic)
-                  ..add(salt)
-                  ..add(box.nonce)
-                  ..add(box.cipherText)
-                  ..add(box.mac.bytes))
-                .toBytes();
-          }
-
-          Future<Map<String, dynamic>> decryptJob(Map<String, dynamic> a) async {
-            final String code = a['code'];
-            final Uint8List d = a['data'];
-            if (d.length < 48 || !listEquals(d.sublist(0, 4), _magic)) {
-              throw Exception('Yeh file is app se encrypt nahi hui.');
+              final total = await input.length();
+              var pos = 0;
+              var counter = 1;
+              while (true) {
+                final n = min(kChunk, total - pos);
+                final buf = n > 0 ? await input.read(n) : Uint8List(0);
+                pos += n;
+                final last = pos >= total;
+                final box = await aes.encrypt(buf,
+                    secretKey: key,
+                    nonce: _nonce(prefix, counter++),
+                    aad: [last ? 1 : 0]);
+                out.add(box.cipherText);
+                out.add(box.mac.bytes);
+                if (last) break;
+              }
+              await out.flush();
+            } finally {
+              await input.close();
+              await out.close();
             }
-            final salt = d.sublist(4, 20);
-            final nonce = d.sublist(20, 32);
-            final cipher = d.sublist(32, d.length - 16);
-            final mac = d.sublist(d.length - 16);
-
-            final key = await _deriveKey(code, salt);
-            final plain = await AesGcm.with256bits().decrypt(
-              SecretBox(cipher, nonce: nonce, mac: Mac(mac)),
-              secretKey: key,
-            );
-            final extLen = plain[0];
-            final ext = utf8.decode(plain.sublist(1, 1 + extLen));
-            return {'ext': ext, 'data': Uint8List.fromList(plain.sublist(1 + extLen))};
           }
 
-          String generateCode([int len = 12]) {
-            const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+          Future<String> _decryptFile(String code, String src, String dst) async {
+            final input = await File(src).open();
+            try {
+              final fileLen = await input.length();
+              if (fileLen < 29 + 16 + 16) throw Exception('bad file');
+              final head = await input.read(29);
+              if (!listEquals(head.sublist(0, 4), kMagic)) {
+                throw Exception('bad format');
+              }
+              final salt = head.sublist(4, 20);
+              final prefix = head.sublist(20, 28);
+              final extLen = head[28];
+              final key = await _deriveKey(code, salt);
+              final aes = AesGcm.with256bits();
+
+              final metaEnc = await input.read(extLen + 16);
+              final extBytes = await aes.decrypt(
+                SecretBox(metaEnc.sublist(0, extLen),
+                    nonce: _nonce(prefix, 0),
+                    mac: Mac(metaEnc.sublist(extLen))),
+                secretKey: key,
+                aad: const [9],
+              );
+
+              var pos = 29 + extLen + 16;
+              var counter = 1;
+              final out = File(dst).openWrite();
+              try {
+                while (pos < fileLen) {
+                  final n = min(kChunk + 16, fileLen - pos);
+                  final enc = await input.read(n);
+                  pos += n;
+                  final last = pos >= fileLen;
+                  final plain = await aes.decrypt(
+                    SecretBox(enc.sublist(0, n - 16),
+                        nonce: _nonce(prefix, counter++),
+                        mac: Mac(enc.sublist(n - 16))),
+                    secretKey: key,
+                    aad: [last ? 1 : 0],
+                  );
+                  out.add(plain);
+                }
+                await out.flush();
+              } finally {
+                await out.close();
+              }
+              return utf8.decode(extBytes);
+            } finally {
+              await input.close();
+            }
+          }
+
+          Future<String> _hashPin(String pin, Uint8List salt) async {
+            final k = await Pbkdf2(
+              macAlgorithm: Hmac.sha256(),
+              iterations: 50000,
+              bits: 256,
+            ).deriveKeyFromPassword(password: pin, nonce: salt);
+            return base64.encode(await k.extractBytes());
+          }
+
+          // Background isolate wrappers (heavy work UI ko freeze nahi karta)
+          Future<void> encryptInBg(String code, String src, String dst, String ext) =>
+              Isolate.run(() => _encryptFile(code, src, dst, ext));
+          Future<String> decryptInBg(String code, String src, String dst) =>
+              Isolate.run(() => _decryptFile(code, src, dst));
+          Future<String> hashInBg(String pin, List<int> salt) =>
+              Isolate.run(() => _hashPin(pin, Uint8List.fromList(salt)));
+
+          // ---------------------------------------------------------------
+          // HELPERS
+          // ---------------------------------------------------------------
+          bool skipLock = false;
+          VoidCallback? lockNowHook;
+          final navKey = GlobalKey<NavigatorState>();
+
+          String generateCode([int len = 16]) {
+            const chars =
+                'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
             final r = Random.secure();
             return List.generate(len, (_) => chars[r.nextInt(chars.length)]).join();
           }
+
+          String newId() {
+            final r = Random.secure();
+            return List.generate(16, (_) => r.nextInt(16).toRadixString(16)).join();
+          }
+
+          void copySecret(String s) {
+            Clipboard.setData(ClipboardData(text: s));
+            Future.delayed(const Duration(seconds: 30),
+                () => Clipboard.setData(const ClipboardData(text: '')));
+          }
+
+          Future<void> shred(File f) async {
+            try {
+              if (await f.exists()) {
+                final len = await f.length();
+                final raf = await f.open(mode: FileMode.writeOnly);
+                final z = Uint8List(65536);
+                var left = len;
+                while (left > 0) {
+                  final n = min(left, z.length);
+                  await raf.writeFrom(z, 0, n);
+                  left -= n;
+                }
+                await raf.flush();
+                await raf.close();
+              }
+            } catch (_) {}
+            try {
+              await f.delete();
+            } catch (_) {}
+          }
+
+          Future<void> cleanTemp() async {
+            try {
+              for (final e in (await getTemporaryDirectory()).listSync()) {
+                if (e is File && e.uri.pathSegments.last.startsWith('v_')) {
+                  await shred(e);
+                }
+              }
+            } catch (_) {}
+          }
+
+          Future<Directory> vaultDir() async {
+            final d =
+                Directory('${(await getApplicationDocumentsDirectory()).path}/vault');
+            if (!await d.exists()) await d.create(recursive: true);
+            return d;
+          }
+
+          Future<List<Map<String, dynamic>>> loadIndex() async {
+            final s = (await SharedPreferences.getInstance()).getString('index');
+            if (s == null) return [];
+            return (jsonDecode(s) as List).cast<Map<String, dynamic>>();
+          }
+
+          Future<void> saveIndex(List<Map<String, dynamic>> l) async {
+            await (await SharedPreferences.getInstance())
+                .setString('index', jsonEncode(l));
+          }
+
+          Future<T> withBusy<T>(BuildContext c, Future<T> Function() job) async {
+            showDialog(
+              context: c,
+              barrierDismissible: false,
+              builder: (_) => const PopScope(
+                canPop: false,
+                child: Center(child: CircularProgressIndicator()),
+              ),
+            );
+            try {
+              return await job();
+            } finally {
+              if (c.mounted && Navigator.of(c, rootNavigator: true).canPop()) {
+                Navigator.of(c, rootNavigator: true).pop();
+              }
+            }
+          }
+
+          Future<String?> askCode(BuildContext c,
+              {required String title,
+              String initial = '',
+              bool canGenerate = false}) {
+            final ctrl = TextEditingController(text: initial);
+            return showDialog<String>(
+              context: c,
+              builder: (_) => StatefulBuilder(
+                builder: (ctx, setS) => AlertDialog(
+                  title: Text(title),
+                  content: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      TextField(
+                        controller: ctrl,
+                        autofocus: true,
+                        obscureText: !canGenerate,
+                        decoration: InputDecoration(
+                          border: const OutlineInputBorder(),
+                          labelText: 'Code',
+                          suffixIcon: IconButton(
+                            icon: const Icon(Icons.copy),
+                            onPressed: () => copySecret(ctrl.text),
+                          ),
+                        ),
+                      ),
+                      if (canGenerate)
+                        TextButton.icon(
+                          onPressed: () => setS(() => ctrl.text = generateCode()),
+                          icon: const Icon(Icons.autorenew),
+                          label: const Text('Naya code'),
+                        ),
+                    ],
+                  ),
+                  actions: [
+                    TextButton(
+                        onPressed: () => Navigator.pop(ctx),
+                        child: const Text('Cancel')),
+                    FilledButton(
+                        onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+                        child: const Text('OK')),
+                  ],
+                ),
+              ),
+            );
+          }
+
+          // ---------------------------------------------------------------
+          // PIN
+          // ---------------------------------------------------------------
+          class Pin {
+            static Future<bool> isSet() async =>
+                (await SharedPreferences.getInstance()).containsKey('pin_hash');
+
+            static Future<void> set(String pin) async {
+              final p = await SharedPreferences.getInstance();
+              final r = Random.secure();
+              final salt = List<int>.generate(16, (_) => r.nextInt(256));
+              await p.setString('pin_salt', base64.encode(salt));
+              await p.setString('pin_hash', await hashInBg(pin, salt));
+              await p.setInt('fails', 0);
+            }
+
+            static Future<int> waitSeconds() async {
+              final p = await SharedPreferences.getInstance();
+              final left =
+                  (p.getInt('until') ?? 0) - DateTime.now().millisecondsSinceEpoch;
+              return left > 0 ? (left / 1000).ceil() : 0;
+            }
+
+            static Future<bool> verify(String pin) async {
+              final p = await SharedPreferences.getInstance();
+              final salt = base64.decode(p.getString('pin_salt')!);
+              final h = await hashInBg(pin, salt);
+              if (h == p.getString('pin_hash')) {
+                await p.setInt('fails', 0);
+                return true;
+              }
+              final f = (p.getInt('fails') ?? 0) + 1;
+              await p.setInt('fails', f);
+              if (f >= 5) {
+                await p.setInt('until',
+                    DateTime.now().millisecondsSinceEpoch + 30000 * (f - 4));
+              }
+              return false;
+            }
+          }
+
+          // ---------------------------------------------------------------
+          // APP
+          // ---------------------------------------------------------------
+          void main() => runApp(const VaultApp());
 
           class VaultApp extends StatelessWidget {
             const VaultApp({super.key});
             @override
             Widget build(BuildContext context) => MaterialApp(
+                  navigatorKey: navKey,
                   title: 'Vault',
                   debugShowCheckedModeBanner: false,
-                  theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
-                  home: const HomePage(),
+                  theme: ThemeData(
+                      colorSchemeSeed: Colors.teal,
+                      useMaterial3: true,
+                      brightness: Brightness.dark),
+                  home: const Gate(),
                 );
           }
 
-          class HomePage extends StatefulWidget {
-            const HomePage({super.key});
+          class Gate extends StatefulWidget {
+            const Gate({super.key});
             @override
-            State<HomePage> createState() => _HomePageState();
+            State<Gate> createState() => _GateState();
           }
 
-          class _HomePageState extends State<HomePage> {
-            final _codeCtrl = TextEditingController();
-            bool _busy = false;
-            String _status = '';
+          class _GateState extends State<Gate> with WidgetsBindingObserver {
+            bool? _hasPin;
+            bool _locked = true;
 
-            void _msg(String s) => setState(() => _status = s);
+            @override
+            void initState() {
+              super.initState();
+              WidgetsBinding.instance.addObserver(this);
+              lockNowHook = _lock;
+              cleanTemp();
+              Pin.isSet().then((v) {
+                if (mounted) setState(() => _hasPin = v);
+              });
+            }
 
-            Future<void> _encrypt() async {
-              final pick = await FilePicker.platform.pickFiles(
-                type: FileType.media,
-                withData: true,
-              );
-              if (pick == null || pick.files.single.bytes == null) return;
-              final f = pick.files.single;
+            @override
+            void dispose() {
+              WidgetsBinding.instance.removeObserver(this);
+              super.dispose();
+            }
 
-              if (_codeCtrl.text.trim().isEmpty) _codeCtrl.text = generateCode();
-              final code = _codeCtrl.text.trim();
+            void _lock() {
+              navKey.currentState?.popUntil((r) => r.isFirst);
+              if (mounted) setState(() => _locked = true);
+            }
 
-              setState(() => _busy = true);
-              _msg('Encrypt ho rahi hai...');
-              try {
-                final out = await compute(encryptJob, {
-                  'code': code,
-                  'data': f.bytes!,
-                  'ext': f.extension ?? '',
-                });
-                final base = f.name.contains('.')
-                    ? f.name.substring(0, f.name.lastIndexOf('.'))
-                    : f.name;
-                final path = await FilePicker.platform.saveFile(
-                  dialogTitle: 'Encrypted file save karein',
-                  fileName: '$base.vlt',
-                  bytes: out,
+            @override
+            void didChangeAppLifecycleState(AppLifecycleState s) {
+              if (s == AppLifecycleState.paused && !skipLock) _lock();
+              if (s == AppLifecycleState.resumed) skipLock = false;
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              if (_hasPin == null) {
+                return const Scaffold(
+                    body: Center(child: CircularProgressIndicator()));
+              }
+              if (_locked) {
+                return LockScreen(
+                  setup: !_hasPin!,
+                  onUnlocked: () => setState(() {
+                    _hasPin = true;
+                    _locked = false;
+                  }),
                 );
-                _msg(path == null
-                    ? 'Save cancel ho gaya.'
-                    : 'Encrypt ho gayi! Code yaad rakhein: $code');
-              } catch (e) {
-                _msg('Error: $e');
+              }
+              return const VaultHome();
+            }
+          }
+
+          class LockScreen extends StatefulWidget {
+            final bool setup;
+            final VoidCallback onUnlocked;
+            const LockScreen({super.key, required this.setup, required this.onUnlocked});
+            @override
+            State<LockScreen> createState() => _LockScreenState();
+          }
+
+          class _LockScreenState extends State<LockScreen> {
+            final _a = TextEditingController();
+            final _b = TextEditingController();
+            String _err = '';
+            bool _busy = false;
+
+            Future<void> _go() async {
+              setState(() {
+                _busy = true;
+                _err = '';
+              });
+              try {
+                if (widget.setup) {
+                  if (_a.text.length < 4) {
+                    _err = 'Kam az kam 4 digit ka PIN rakhein';
+                  } else if (_a.text != _b.text) {
+                    _err = 'Dono PIN match nahi karte';
+                  } else {
+                    await Pin.set(_a.text);
+                    widget.onUnlocked();
+                    return;
+                  }
+                } else {
+                  final w = await Pin.waitSeconds();
+                  if (w > 0) {
+                    _err = '$w second baad dobara try karein';
+                  } else if (await Pin.verify(_a.text)) {
+                    widget.onUnlocked();
+                    return;
+                  } else {
+                    _err = 'Galat PIN';
+                  }
+                  _a.clear();
+                }
               } finally {
-                setState(() => _busy = false);
+                if (mounted) setState(() => _busy = false);
               }
             }
 
-            Future<void> _decrypt() async {
-              final code = _codeCtrl.text.trim();
-              if (code.isEmpty) {
-                _msg('Pehle code enter karein.');
+            Widget _field(TextEditingController c, String label) => Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: TextField(
+                    controller: c,
+                    obscureText: true,
+                    keyboardType: TextInputType.number,
+                    maxLength: 12,
+                    inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                    decoration: InputDecoration(
+                        border: const OutlineInputBorder(), labelText: label),
+                  ),
+                );
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                body: SafeArea(
+                  child: Center(
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.all(28),
+                      child: Column(
+                        children: [
+                          const Icon(Icons.shield, size: 72),
+                          const SizedBox(height: 12),
+                          Text(
+                            widget.setup ? 'Naya PIN set karein' : 'PIN enter karein',
+                            style: Theme.of(context).textTheme.titleLarge,
+                          ),
+                          const SizedBox(height: 20),
+                          _field(_a, 'PIN'),
+                          if (widget.setup) _field(_b, 'PIN dobara'),
+                          if (_err.isNotEmpty)
+                            Text(_err,
+                                style: const TextStyle(color: Colors.redAccent)),
+                          const SizedBox(height: 16),
+                          FilledButton(
+                            onPressed: _busy ? null : _go,
+                            child: Text(widget.setup ? 'PIN save karein' : 'Unlock'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }
+          }
+
+          // ---------------------------------------------------------------
+          // VAULT HOME
+          // ---------------------------------------------------------------
+          class VaultHome extends StatefulWidget {
+            const VaultHome({super.key});
+            @override
+            State<VaultHome> createState() => _VaultHomeState();
+          }
+
+          class _VaultHomeState extends State<VaultHome> {
+            List<Map<String, dynamic>> _items = [];
+
+            @override
+            void initState() {
+              super.initState();
+              _reload();
+            }
+
+            Future<void> _reload() async {
+              final l = await loadIndex();
+              if (mounted) setState(() => _items = l.reversed.toList());
+            }
+
+            void _snack(String s) {
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(s)));
+              }
+            }
+
+            Future<void> _add() async {
+              skipLock = true;
+              final r = await FilePicker.platform.pickFiles(type: FileType.media);
+              if (r == null || r.files.single.path == null) return;
+              final f = r.files.single;
+              if (!mounted) return;
+              final code = await askCode(context,
+                  title: 'Encryption code',
+                  initial: generateCode(16),
+                  canGenerate: true);
+              if (code == null) return;
+              if (code.length < 8) {
+                _snack('Code kam az kam 8 characters ka hona chahiye');
                 return;
               }
-              final pick = await FilePicker.platform
-                  .pickFiles(type: FileType.any, withData: true);
-              if (pick == null || pick.files.single.bytes == null) return;
-              final f = pick.files.single;
-
-              setState(() => _busy = true);
-              _msg('Decrypt ho rahi hai...');
+              if (!mounted) return;
+              final id = newId();
+              final dst = '${(await vaultDir()).path}/$id.vlt';
               try {
-                final res = await compute(decryptJob, {'code': code, 'data': f.bytes!});
-                final ext = res['ext'] as String;
-                final base = f.name.contains('.')
-                    ? f.name.substring(0, f.name.lastIndexOf('.'))
-                    : f.name;
-                final path = await FilePicker.platform.saveFile(
-                  dialogTitle: 'Decrypted file save karein',
-                  fileName: ext.isEmpty ? base : '$base.$ext',
-                  bytes: res['data'] as Uint8List,
-                );
-                _msg(path == null ? 'Save cancel ho gaya.' : 'Decrypt ho gayi!');
+                await withBusy(context,
+                    () => encryptInBg(code, f.path!, dst, (f.extension ?? '').toLowerCase()));
               } catch (e) {
-                _msg('Code galat hai ya file kharab hai.');
-              } finally {
-                setState(() => _busy = false);
+                await shred(File(dst));
+                _snack('Encrypt nahi ho saki: $e');
+                return;
               }
+              if (f.path!.contains('/cache/')) {
+                try {
+                  await File(f.path!).delete();
+                } catch (_) {}
+              }
+              final idx = await loadIndex();
+              idx.add({
+                'id': id,
+                'name': f.name,
+                'size': await File(dst).length(),
+                'ts': DateTime.now().millisecondsSinceEpoch,
+              });
+              await saveIndex(idx);
+              _snack('Encrypt ho gayi. Code surakshit rakhein, wapas nahi milega!');
+              _reload();
+            }
+
+            Future<void> _import() async {
+              skipLock = true;
+              final r = await FilePicker.platform.pickFiles(type: FileType.any);
+              if (r == null || r.files.single.path == null) return;
+              final src = r.files.single.path!;
+              final raf = await File(src).open();
+              final h = await raf.read(4);
+              await raf.close();
+              if (!listEquals(h, kMagic)) {
+                _snack('Yeh Vault ki .vlt file nahi hai');
+                return;
+              }
+              final id = newId();
+              final dst = '${(await vaultDir()).path}/$id.vlt';
+              await File(src).copy(dst);
+              if (src.contains('/cache/')) {
+                try {
+                  await File(src).delete();
+                } catch (_) {}
+              }
+              final idx = await loadIndex();
+              idx.add({
+                'id': id,
+                'name': 'Received file',
+                'size': await File(dst).length(),
+                'ts': DateTime.now().millisecondsSinceEpoch,
+              });
+              await saveIndex(idx);
+              _snack('File import ho gayi. Ab code se khol sakte hain.');
+              _reload();
+            }
+
+            Future<String?> _decryptToTemp(Map<String, dynamic> it) async {
+              final code = await askCode(context, title: 'Code enter karein');
+              if (code == null || code.isEmpty || !mounted) return null;
+              final src = '${(await vaultDir()).path}/${it['id']}.vlt';
+              final tmp = '${(await getTemporaryDirectory()).path}/v_${it['id']}';
+              try {
+                final ext = await withBusy(context, () => decryptInBg(code, src, tmp));
+                final out = ext.isEmpty ? tmp : '$tmp.$ext';
+                if (out != tmp) await File(tmp).rename(out);
+                return out;
+              } catch (_) {
+                await shred(File(tmp));
+                _snack('Code galat hai ya file kharab hai');
+                return null;
+              }
+            }
+
+            Future<void> _open(Map<String, dynamic> it) async {
+              final p = await _decryptToTemp(it);
+              if (p == null || !mounted) return;
+              await Navigator.push(
+                  context, MaterialPageRoute(builder: (_) => Viewer(path: p)));
+            }
+
+            Future<void> _share(Map<String, dynamic> it) async {
+              skipLock = true;
+              final path = '${(await vaultDir()).path}/${it['id']}.vlt';
+              await Share.shareXFiles(
+                [XFile(path, mimeType: 'application/octet-stream')],
+                text: 'Encrypted Vault file. Code alag se bhej raha hun.',
+              );
+            }
+
+            Future<void> _save(Map<String, dynamic> it) async {
+              final p = await _decryptToTemp(it);
+              if (p == null) return;
+              skipLock = true;
+              try {
+                final dot = p.lastIndexOf('.');
+                final slash = p.lastIndexOf('/');
+                final ext = dot > slash ? p.substring(dot) : '';
+                final base = it['name'] as String;
+                final name = base.contains('.') ? base : 'decrypted_${it['id']}$ext';
+                await FilePicker.platform.saveFile(
+                  dialogTitle: 'Decrypted file save karein',
+                  fileName: name,
+                  bytes: await File(p).readAsBytes(),
+                );
+                _snack('Save ho gayi');
+              } catch (e) {
+                _snack('Save nahi ho saki: $e');
+              } finally {
+                await shred(File(p));
+              }
+            }
+
+            Future<void> _delete(Map<String, dynamic> it) async {
+              final ok = await showDialog<bool>(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text('Delete karein?'),
+                  content: const Text('File hamesha ke liye mit jayegi.'),
+                  actions: [
+                    TextButton(
+                        onPressed: () => Navigator.pop(ctx, false),
+                        child: const Text('Nahi')),
+                    FilledButton(
+                        onPressed: () => Navigator.pop(ctx, true),
+                        child: const Text('Delete')),
+                  ],
+                ),
+              );
+              if (ok != true) return;
+              await shred(File('${(await vaultDir()).path}/${it['id']}.vlt'));
+              final idx = await loadIndex();
+              idx.removeWhere((e) => e['id'] == it['id']);
+              await saveIndex(idx);
+              _reload();
             }
 
             @override
             Widget build(BuildContext context) {
               return Scaffold(
-                appBar: AppBar(title: const Text('Vault - Encrypt / Decrypt')),
-                body: ListView(
-                  padding: const EdgeInsets.all(20),
-                  children: [
-                    TextField(
-                      controller: _codeCtrl,
-                      decoration: InputDecoration(
-                        labelText: 'Code',
-                        border: const OutlineInputBorder(),
-                        suffixIcon: IconButton(
-                          icon: const Icon(Icons.copy),
-                          onPressed: () =>
-                              Clipboard.setData(ClipboardData(text: _codeCtrl.text)),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: TextButton.icon(
-                        onPressed: () => setState(() => _codeCtrl.text = generateCode()),
-                        icon: const Icon(Icons.autorenew),
-                        label: const Text('Naya code generate karein'),
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    FilledButton.icon(
-                      onPressed: _busy ? null : _encrypt,
-                      icon: const Icon(Icons.lock),
-                      label: const Text('Image / Video Encrypt karein'),
-                    ),
-                    const SizedBox(height: 12),
-                    OutlinedButton.icon(
-                      onPressed: _busy ? null : _decrypt,
-                      icon: const Icon(Icons.lock_open),
-                      label: const Text('.vlt file Decrypt karein'),
-                    ),
-                    const SizedBox(height: 24),
-                    if (_busy) const LinearProgressIndicator(),
-                    const SizedBox(height: 12),
-                    SelectableText(_status),
+                appBar: AppBar(
+                  title: const Text('Vault'),
+                  actions: [
+                    IconButton(
+                        tooltip: 'Import .vlt',
+                        icon: const Icon(Icons.download),
+                        onPressed: _import),
+                    IconButton(
+                        tooltip: 'Lock',
+                        icon: const Icon(Icons.lock),
+                        onPressed: () => lockNowHook?.call()),
                   ],
                 ),
+                floatingActionButton: FloatingActionButton.extended(
+                  onPressed: _add,
+                  icon: const Icon(Icons.add),
+                  label: const Text('Encrypt karein'),
+                ),
+                body: _items.isEmpty
+                    ? const Center(
+                        child: Padding(
+                          padding: EdgeInsets.all(24),
+                          child: Text(
+                            'Vault khali hai.\nImage ya video encrypt karne ke liye neeche button dabayein.',
+                            textAlign: TextAlign.center,
+                          ),
+                        ),
+                      )
+                    : ListView.builder(
+                        itemCount: _items.length,
+                        itemBuilder: (_, i) {
+                          final it = _items[i];
+                          final mb = ((it['size'] as num) / 1048576).toStringAsFixed(2);
+                          final date = DateTime.fromMillisecondsSinceEpoch(it['ts'] as int)
+                              .toString()
+                              .substring(0, 16);
+                          return ListTile(
+                            leading: const Icon(Icons.lock_outline),
+                            title: Text(it['name'] as String,
+                                maxLines: 1, overflow: TextOverflow.ellipsis),
+                            subtitle: Text('$mb MB  •  $date'),
+                            onTap: () => _open(it),
+                            trailing: PopupMenuButton<String>(
+                              onSelected: (v) {
+                                if (v == 'share') _share(it);
+                                if (v == 'save') _save(it);
+                                if (v == 'del') _delete(it);
+                              },
+                              itemBuilder: (_) => const [
+                                PopupMenuItem(
+                                    value: 'share', child: Text('Share (encrypted)')),
+                                PopupMenuItem(
+                                    value: 'save', child: Text('Decrypt aur save')),
+                                PopupMenuItem(value: 'del', child: Text('Delete')),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+              );
+            }
+          }
+
+          // ---------------------------------------------------------------
+          // VIEWER (decrypted file sirf temp me, band hote hi mit jati hai)
+          // ---------------------------------------------------------------
+          class Viewer extends StatefulWidget {
+            final String path;
+            const Viewer({super.key, required this.path});
+            @override
+            State<Viewer> createState() => _ViewerState();
+          }
+
+          class _ViewerState extends State<Viewer> {
+            VideoPlayerController? _vc;
+            bool _video = false;
+
+            @override
+            void initState() {
+              super.initState();
+              final e = widget.path.split('.').last.toLowerCase();
+              _video = const {'mp4', 'mov', 'mkv', '3gp', 'webm', 'avi', 'm4v'}
+                  .contains(e);
+              if (_video) {
+                final c = VideoPlayerController.file(File(widget.path));
+                _vc = c;
+                c.addListener(() {
+                  if (mounted) setState(() {});
+                });
+                c.initialize().then((_) => c.play());
+              }
+            }
+
+            @override
+            void dispose() {
+              _vc?.dispose();
+              shred(File(widget.path));
+              super.dispose();
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              Widget body;
+              if (_video) {
+                final c = _vc!;
+                body = c.value.isInitialized
+                    ? Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          AspectRatio(
+                              aspectRatio: c.value.aspectRatio, child: VideoPlayer(c)),
+                          VideoProgressIndicator(c, allowScrubbing: true),
+                          IconButton(
+                            icon: Icon(
+                                c.value.isPlaying ? Icons.pause : Icons.play_arrow),
+                            onPressed: () => c.value.isPlaying ? c.pause() : c.play(),
+                          ),
+                        ],
+                      )
+                    : const CircularProgressIndicator();
+              } else {
+                body = InteractiveViewer(
+                  child: Image.file(
+                    File(widget.path),
+                    errorBuilder: (_, __, ___) => const Text('Preview nahi ho saka'),
+                  ),
+                );
+              }
+              return Scaffold(
+                backgroundColor: Colors.black,
+                appBar: AppBar(title: Text(_video ? 'Video' : 'Image')),
+                body: Center(child: body),
               );
             }
           }

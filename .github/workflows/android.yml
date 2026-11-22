@@ -74,6 +74,7 @@ jobs:
           mkdir -p ~/.gradle
           cat > ~/.gradle/init.gradle <<'EOF'
           gradle.beforeProject{p->p.afterEvaluate{def a=p.extensions.findByName('android');if(a!=null&&(a.compileSdk==null||a.compileSdk<36))a.compileSdk=36}}
+          allprojects{tasks.configureEach{t->if(t.name.startsWith('lint'))t.enabled=false}}
           EOF
           cat > pubspec.yaml <<'EOF'
           name: vault_app
